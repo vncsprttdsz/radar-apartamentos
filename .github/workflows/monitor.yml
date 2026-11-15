@@ -1,0 +1,76 @@
+name: Monitor de imóveis
+
+on:
+  # Agenda principal: cron-job.org dispara este workflow (workflow_dispatch pela API) a cada 2 h, das 5h17 às
+  # 21h17 de Brasília — o agendador do próprio GitHub atrasava ou pulava execuções (intervalos de 6–11 h).
+  # Reserva: uma execução diária às 1h47 de Brasília, fora dos horários do cron-job.org, caso o serviço pare.
+  schedule:
+    - cron: "47 4 * * *"
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "Salvar respostas brutas dos sites (para diagnóstico)"
+        type: boolean
+        default: false
+      test_notify:
+        description: "Só enviar uma mensagem de teste"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+      CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      DEBUG: ${{ inputs.debug && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      # Uma coleta que esperou na fila (concurrency) parte do commit de quando foi disparada; atualiza para o
+      # estado mais recente antes de rodar, para não reavisar anúncios que a coleta anterior já registrou.
+      - name: Atualizar para o estado mais recente
+        run: git fetch --depth=1 origin "$GITHUB_REF_NAME" && git reset --hard FETCH_HEAD
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Teste de notificação
+        if: ${{ inputs.test_notify }}
+        run: python -m imoveis --test-notify
+
+      - name: Verificar anúncios
+        if: ${{ !inputs.test_notify }}
+        run: python -m imoveis
+
+      - name: Salvar estado
+        if: ${{ !inputs.test_notify }}
+        run: |
+          git config user.name "monitor-imoveis[bot]"
+          git config user.email "monitor-imoveis@users.noreply.github.com"
+          git add data/ docs/ ANUNCIOS.md
+          git diff --cached --quiet || git commit -m "Atualiza anúncios $(date -u +'%Y-%m-%d %H:%M')"
+          git pull --rebase -X theirs origin "$GITHUB_REF_NAME" || true
+          git push
+
+      - name: Respostas brutas (debug)
+        if: ${{ always() && inputs.debug }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/

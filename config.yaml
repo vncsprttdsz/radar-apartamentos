@@ -1,0 +1,82 @@
+# Critérios de busca — edite aqui e faça commit; a próxima coleta já usa os novos valores.
+# Os valores abaixo são um EXEMPLO (zona sul de São Paulo): troque pelos seus.
+
+bairros:                   # nomes como aparecem nos portais (ZAP/Viva Real)
+  - Vila Nova Conceição
+  - Itaim Bibi
+cidade: São Paulo
+estado: SP
+
+area_minima_m2: 100        # o painel mostra a partir desta área
+
+# Tipos aceitos (apartamento inclui cobertura, duplex, flat etc.)
+tipos: [apartamento]
+
+# Comprar e/ou alugar
+negocios: [venda, aluguel]
+
+# Orçamento (null = sem limite). Vale para os AVISOS; o painel mostra o mercado inteiro (filtro "Só no orçamento").
+# Aluguel: valor total mensal (aluguel + condomínio + IPTU quando disponível).
+preco_max_venda: 2000000
+preco_max_aluguel: 15000
+
+# Sites monitorados (desligue algum colocando false)
+fontes:
+  zap: true
+  vivareal: true
+  quintoandar: true
+  zuk: true
+
+# Avisos (WhatsApp via CallMeBot; também Telegram, ntfy ou e-mail — ver README).
+avisos:
+  area_minima_m2: 120          # só avisa imóveis com esta área ou mais
+  quartos_minimos: 3           # e com pelo menos estes quartos (anúncio sem a informação é avisado)
+  destacar_andar_alto_vista: true   # lê a descrição do anúncio (ZAP) para achar andar alto e vista livre
+  perto_de_parque_m: 500       # destaque: até X m da borda de um parque de imoveis/parques.json (0 desliga)
+  # true: anúncio novo só avisa com pelo menos um destaque — andar alto, vista livre, perto de parque, piscina
+  # privativa ou churrasqueira do apartamento (piscina/churrasqueira do prédio só acompanham, não contam).
+  # false: avisa todo anúncio novo que passe nos filtros; os destaques só marcam com ⭐.
+  novos_so_com_destaque: false
+  imediato: [aluguel]          # avisados a cada coleta: anúncio novo e queda de preço
+  resumo_diario: [venda, leilao]   # uma mensagem por dia: novos (com destaque, se exigido) e quedas de preço
+  resumo_diario_hora: 19       # enviado na 1ª coleta a partir desta hora; cobre das 19h de ontem às 19h de hoje
+painel_url: https://SEU-USUARIO.github.io/SEU-REPOSITORIO/   # aparece no fim do resumo diário
+
+# Aviso de queda de preço de um anúncio já visto: X% ou mais (mesmos filtros dos avisos de novos; não precisa
+# de destaque). Quedas em degraus somam (compara com o maior preço desde o último aviso de queda).
+alerta_queda_preco_pct: 10
+
+# R$/m² vs. mediana dos anúncios do mesmo bairro, negócio e faixa de área (aluguel: valor total por m²).
+# Com avisar: true, anúncio X% ou mais abaixo da mediana gera aviso próprio ("💎"); com false, a diferença só
+# aparece como informação nas mensagens. so_no_orcamento: compara só com os anúncios dentro do orçamento.
+alerta_abaixo_mediana:
+  avisar: true
+  pct: 25
+  amostra_minima: 15      # anúncios no grupo de comparação; com menos, compara com o bairro inteiro
+  so_no_orcamento: true
+
+# Histórico de transações (ITBI pago, Prefeitura de SP) — aba "Transações" do painel. Rode o workflow
+# "Transações (ITBI)" uma vez depois de instalar; depois ele roda sozinho nos dias 4 e 19.
+# Bairro de cada transação = bairro dos Correios do CEP (a coluna "Bairro" do ITBI é texto livre e falha muito).
+transacoes:
+  bairros:            # nome exibido: bairros dos Correios que entram nele
+    Itaim Bibi: [Itaim Bibi, Chácara Itaim]
+    Vila Nova Conceição: [Vila Nova Conceição]
+  prefixos_cep: ["045"]          # pré-filtro pelos 3 primeiros dígitos do CEP dos seus bairros (acelera a leitura)
+  janela_meses: 24               # meses guardados e exibidos (a partir do mês mais recente com dados)
+  fator_area_util: 0.72          # área útil do anúncio ≈ 0,72 × área construída do ITBI (ver diagnostico/itbi)
+  outliers_percentis: [1, 99]    # R$/m² fora desta faixa, por bairro, sai das métricas (fica marcado na tabela)
+  n_minimo: 5                    # células com menos transações ficam ocultas
+  lote_minimo: 5                 # N+ transações no mesmo prédio e data = compra em bloco (fora das métricas)
+  predio_novo_anos: 2            # ACC até N anos antes da transação = prédio novo (preço pode ser da planta)
+
+# Área de interesse (filtro geográfico): polígono [lat, lon] desenhado em docs/area.html ("Copiar coordenadas").
+# Com ativo: true, os avisos só valem para anúncios dentro do polígono; o painel mostra tudo o que fica dentro
+# dele (rótulos de outros bairros entram no grupo "Outros na área") e ganha o filtro "Só na minha área".
+# O QuintoAndar busca por retângulo: com a área ativa, cobre o polígono inteiro; sem ela, só os bairros que têm
+# retângulo em imoveis/sources/quintoandar.py (VIEWPORTS) — para outros bairros, ative a área ou inclua o retângulo.
+area_de_interesse:
+  ativo: false
+  avisar_sem_coordenadas: true   # anúncio sem localização passa (raro)
+  bairros_extras: []             # outros bairros consultados no ZAP/Viva Real, valendo só o que cair na área
+  poligono: []

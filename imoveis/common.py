@@ -1,0 +1,248 @@
+"""Modelos, configuração e utilitários compartilhados."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import unicodedata
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+import yaml
+
+from .geo import inside
+
+ROOT = Path(__file__).resolve().parent.parent
+DEBUG_DIR = ROOT / "debug"
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def norm(text: str | None) -> str:
+    """Minúsculas, sem acentos e espaços colapsados — para comparar bairros."""
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKD", str(text))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", norm(text)).strip("-")
+
+
+def to_float(value) -> float | None:
+    """Converte '1.234,56', '1234.5', 'R$ 2.500.000' ou números em float."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = re.sub(r"[^\d,.]", "", str(value))
+    if not s:
+        return None
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif s.count(".") > 1 or re.search(r"\.\d{3}$", s):
+        s = s.replace(".", "")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+@dataclass
+class Listing:
+    source: str          # zap | vivareal | quintoandar | zuk
+    id: str
+    url: str
+    business: str        # venda | aluguel | leilao
+    title: str = ""
+    neighborhood: str = ""
+    address: str = ""
+    area: float | None = None
+    price: float | None = None       # venda/lance ou aluguel mensal
+    total_monthly: float | None = None  # aluguel + condomínio + IPTU
+    condo: float | None = None
+    bedrooms: int | None = None
+    parking: int | None = None
+    extra: str = ""      # informação livre (ex.: data do leilão)
+    floor: int | None = None   # andar da unidade, quando o portal informa
+    lat: float | None = None   # coordenadas do prédio (ou aproximadas, quando o anunciante esconde o endereço)
+    lon: float | None = None
+    geo_approx: bool = False
+    air_conditioning: bool | None = None   # comodidade informada pelo portal (True) ou desconhecido (None)
+    free_view: bool | None = None          # "vista livre" informada pelo portal (QuintoAndar)
+    pool: str | None = None                # piscina informada pelo portal: "apto" (privativa) ou "predio" (condomínio)
+    bbq: str | None = None                 # churrasqueira: "apto" (na varanda/da unidade) ou "predio" (condomínio)
+
+    @property
+    def key(self) -> str:
+        return f"{self.source}:{self.business}:{self.id}"
+
+    @property
+    def ref_price(self) -> float | None:
+        return self.total_monthly or self.price
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class Config:
+    neighborhoods: list[str]
+    city: str = "São Paulo"
+    state: str = "SP"
+    min_area: float = 100
+    types: list[str] = field(default_factory=lambda: ["apartamento"])
+    businesses: list[str] = field(default_factory=lambda: ["venda", "aluguel"])
+    max_sale: float | None = None
+    max_rent: float | None = None
+    sources: dict = field(default_factory=dict)
+    price_drop_pct: float = 3
+    bargain_pct: float | None = None       # avisa anúncio X% ou mais abaixo da mediana (None = desligado)
+    bargain_min_n: int = 15                # anúncios mínimos no grupo de comparação
+    bargain_budget_only: bool = True       # só dentro do orçamento
+    bargain_alert: bool = True             # False: a mediana só aparece como informação, sem gerar aviso
+    alert_min_area: float = 0              # área mínima para qualquer aviso (o painel segue com area_minima_m2)
+    alert_min_bedrooms: int = 0            # quartos mínimos para avisar (sem a informação: avisa)
+    immediate: tuple = ("venda", "aluguel", "leilao")   # negócios avisados a cada coleta
+    digest: tuple = ()                     # negócios que vão para o resumo diário
+    digest_hour: int = 23                  # hora de Brasília a partir da qual o resumo do dia é enviado
+    dashboard_url: str = ""
+    area_polygon: list = field(default_factory=list)   # [[lat, lon], ...]; vazio = sem filtro de área
+    area_keep_unknown: bool = True         # anúncio sem coordenadas passa no filtro de área
+    area_extra_neighborhoods: list = field(default_factory=list)   # coletados só pelo que cai dentro da área
+    highlight: bool = False                # busca a descrição dos avisos imediatos e destaca andar alto / vista livre
+    new_require_highlight: bool = False    # anúncio novo só avisa com pelo menos um destaque
+    park_max_m: float = 0                  # destaque "perto do parque": distância máxima até a borda (0 = desligado)
+
+    @property
+    def neighborhoods_norm(self) -> set[str]:
+        return {norm(n) for n in self.neighborhoods}
+
+    @property
+    def query_neighborhoods(self) -> list[str]:
+        """Bairros consultados nos portais: os monitorados + os extras da área de interesse."""
+        return list(self.neighborhoods) + [n for n in self.area_extra_neighborhoods if norm(n) not in self.neighborhoods_norm]
+
+    def in_area(self, l) -> bool:
+        return self.in_area_point(l.lat, l.lon)
+
+    def in_area_point(self, lat, lon) -> bool:
+        return bool(self.area_polygon and lat and lon and inside(lat, lon, self.area_polygon))
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "Config":
+        raw = yaml.safe_load((path or ROOT / "config.yaml").read_text(encoding="utf-8"))
+        return cls(
+            neighborhoods=raw["bairros"],
+            city=raw.get("cidade", "São Paulo"),
+            state=raw.get("estado", "SP"),
+            min_area=float(raw.get("area_minima_m2", 100)),
+            types=[norm(t) for t in raw.get("tipos", ["apartamento"])],
+            businesses=[norm(b) for b in raw.get("negocios", ["venda", "aluguel"])],
+            max_sale=raw.get("preco_max_venda"),
+            max_rent=raw.get("preco_max_aluguel"),
+            sources=raw.get("fontes", {}),
+            price_drop_pct=float(raw.get("alerta_queda_preco_pct") or 0),
+            bargain_pct=(float(raw["alerta_abaixo_mediana"]["pct"]) if (raw.get("alerta_abaixo_mediana") or {}).get("pct") else None),
+            bargain_min_n=int((raw.get("alerta_abaixo_mediana") or {}).get("amostra_minima", 15)),
+            bargain_budget_only=bool((raw.get("alerta_abaixo_mediana") or {}).get("so_no_orcamento", True)),
+            bargain_alert=bool((raw.get("alerta_abaixo_mediana") or {}).get("avisar", True)),
+            alert_min_area=float((raw.get("avisos") or {}).get("area_minima_m2") or 0),
+            alert_min_bedrooms=int((raw.get("avisos") or {}).get("quartos_minimos") or 0),
+            immediate=tuple(norm(b) for b in (raw.get("avisos") or {}).get("imediato", ["venda", "aluguel", "leilao"])),
+            digest=tuple(norm(b) for b in (raw.get("avisos") or {}).get("resumo_diario", [])),
+            digest_hour=int((raw.get("avisos") or {}).get("resumo_diario_hora", 23)),
+            dashboard_url=str(raw.get("painel_url") or ""),
+            highlight=bool((raw.get("avisos") or {}).get("destacar_andar_alto_vista", False)),
+            new_require_highlight=bool((raw.get("avisos") or {}).get("novos_so_com_destaque", False)),
+            park_max_m=float((raw.get("avisos") or {}).get("perto_de_parque_m") or 0),
+            area_polygon=(((raw.get("area_de_interesse") or {}).get("poligono") or [])
+                          if (raw.get("area_de_interesse") or {}).get("ativo") else []),
+            area_keep_unknown=bool((raw.get("area_de_interesse") or {}).get("avisar_sem_coordenadas", True)),
+            area_extra_neighborhoods=(list((raw.get("area_de_interesse") or {}).get("bairros_extras") or [])
+                                      if (raw.get("area_de_interesse") or {}).get("ativo") else []),
+        )
+
+    @staticmethod
+    def plausible(l: Listing) -> bool:
+        """Descarta anúncios com área ou R$/m² impossíveis (erros de digitação do anunciante)."""
+        if l.area is not None and l.area > 1500:
+            return False
+        if l.area and l.price:
+            ppm2 = l.price / l.area
+            if l.business == "venda" and not 4_000 <= ppm2 <= 150_000:
+                return False
+            if l.business == "aluguel" and not 15 <= ppm2 <= 1_000:
+                return False
+        return True
+
+    def matches(self, l: Listing) -> bool:
+        """Bairro, área e tipo — o mercado que o monitor acompanha (sem o teto de preço)."""
+        # Bairro monitorado, ou qualquer rótulo desde que o prédio fique dentro da área de interesse
+        if norm(l.neighborhood) not in self.neighborhoods_norm and not self.in_area(l):
+            return False
+        # Leilões frequentemente não informam área na listagem: só descarta se souber que é menor.
+        if l.area is not None and l.area < self.min_area:
+            return False
+        if l.area is None and l.business != "leilao":
+            return False
+        if not self.plausible(l):
+            return False
+        return True
+
+    def cap(self, business: str) -> float | None:
+        """Teto de preço do negócio. Leilão usa o teto de compra."""
+        return self.max_rent if business == "aluguel" else self.max_sale
+
+    def within_cap(self, business: str, price: float | None) -> bool:
+        cap = self.cap(business)
+        return not cap or price is None or price <= cap
+
+    def in_budget(self, l: Listing) -> bool:
+        return self.within_cap(l.business, l.ref_price)
+
+
+def dump_debug(name: str, content: str | bytes) -> None:
+    """Salva respostas brutas quando DEBUG=1 (útil para ajustar coletores se um site mudar)."""
+    if not os.environ.get("DEBUG"):
+        return
+    DEBUG_DIR.mkdir(exist_ok=True)
+    text = content.decode("utf-8", "replace") if isinstance(content, bytes) else content
+    head = re.sub(r"\s+", " ", text[:600])
+    print(f"[debug] {name} ({len(text)} chars): {head}", file=sys.stderr)
+    mode = "wb" if isinstance(content, bytes) else "w"
+    fname = re.sub(r"[^\w.-]+", "_", name.split(" ")[0])
+    with open(DEBUG_DIR / fname, mode) as f:
+        f.write(content)
+
+
+def iter_dicts(obj):
+    """Percorre recursivamente um JSON e devolve todos os dicts."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from iter_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from iter_dicts(v)
+
+
+NEXT_DATA_RE = re.compile(
+    r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S
+)
+
+
+def next_data(html: str) -> dict | None:
+    m = NEXT_DATA_RE.search(html)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None

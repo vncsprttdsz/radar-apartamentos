@@ -1,0 +1,1014 @@
+import json
+
+import pytest
+
+from imoveis import __main__ as app
+from imoveis.common import Config, Listing, to_float
+from imoveis.sources import grupozap, quintoandar, zuk
+
+
+@pytest.fixture
+def cfg():
+    return Config(neighborhoods=["Vila Nova Conceição", "Itaim Bibi"], min_area=100)
+
+
+def test_to_float():
+    assert to_float("R$ 2.500.000") == 2500000
+    assert to_float("1.234,56") == 1234.56
+    assert to_float("120") == 120
+    assert to_float("135.5") == 135.5
+    assert to_float(None) is None
+
+
+ZAP_ITEM = {
+    "listing": {
+        "id": "2712345678",
+        "title": "Apartamento com 3 quartos",
+        "unitTypes": ["APARTMENT"],
+        "usableAreas": [180],
+        "pricingInfos": [
+            {"businessType": "SALE", "price": "4500000", "monthlyCondoFee": "3200", "yearlyIptu": "12000"},
+            {"businessType": "RENTAL", "price": "18000", "monthlyCondoFee": "3200",
+             "rentalInfo": {"monthlyRentalTotalPrice": "22000"}},
+        ],
+        "address": {"neighborhood": "Vila Nova Conceição", "street": "Rua Afonso Braz", "streetNumber": "100"},
+        "bedrooms": [3],
+        "parkingSpaces": [3],
+    },
+    "link": {"href": "/imovel/venda-apartamento-3-quartos-vila-nova-conceicao-id-2712345678/"},
+}
+
+
+def test_grupozap_sale_and_rent(cfg):
+    sale = grupozap.parse_listing(ZAP_ITEM, "zap", "venda")
+    assert sale.price == 4500000 and sale.area == 180 and sale.bedrooms == 3
+    assert sale.url.startswith("https://www.zapimoveis.com.br/imovel/")
+    assert cfg.matches(sale)
+    rent = grupozap.parse_listing(ZAP_ITEM, "vivareal", "aluguel")
+    assert rent.total_monthly == 22000 and rent.url.startswith("https://www.vivareal.com.br/")
+    assert sale.key != rent.key
+
+
+def test_grupozap_filters(cfg):
+    small = json.loads(json.dumps(ZAP_ITEM))
+    small["listing"]["usableAreas"] = [80]
+    assert not cfg.matches(grupozap.parse_listing(small, "zap", "venda"))
+    other = json.loads(json.dumps(ZAP_ITEM))
+    other["listing"]["address"]["neighborhood"] = "Moema"
+    assert not cfg.matches(grupozap.parse_listing(other, "zap", "venda"))
+    house = json.loads(json.dumps(ZAP_ITEM))
+    house["listing"]["unitTypes"] = ["HOME"]
+    assert grupozap.parse_listing(house, "zap", "venda") is None
+
+
+def test_quintoandar(cfg):
+    h = {"id": 893456789, "area": 140, "rent": 15000, "totalCost": 19500, "type": "Apartamento",
+         "address": "Rua Tabapuã", "neighbourhood": "Itaim Bibi", "bedrooms": 3, "parkingSpots": 2,
+         "forRent": True, "forSale": True, "salePrice": 3900000}
+    rent = quintoandar.parse_house(h, "aluguel")
+    assert rent.total_monthly == 19500 and rent.url == "https://www.quintoandar.com.br/imovel/893456789"
+    assert cfg.matches(rent)
+    sale = quintoandar.parse_house(h, "venda")
+    assert sale.price == 3900000 and sale.url.endswith("/comprar")
+    assert quintoandar.parse_house({**h, "type": "Casa"}, "aluguel") is None
+
+
+ZUK_LIST = """
+<a href="https://www.portalzuk.com.br/imovel/sp/sao-paulo/itaim-bibi/rua-joaquim-floriano-500/31234-198765">x</a>
+<a href="/imovel/sp/sao-paulo/vila-nova-conceicao/rua-domingos-leme-300/31555-200001">y</a>
+<a href="/imovel/sp/sao-paulo/moema/rua-x-1/31000-100000">z</a>
+"""
+
+ZUK_DETAIL = """<html><head><meta property="og:title" content="Apartamento 152 m² - Itaim Bibi"></head>
+<body><h1>Apartamento</h1><p>Área útil: 152,30 m²</p><p>Área total 260,00 m²</p>
+<p>1º Leilão 20/11/2026 às 10:00 Lance mínimo: R$ 3.200.000,00</p>
+<p>2º Leilão 27/11/2026 às 10:00 Lance mínimo: R$ 1.920.000,00</p></body></html>"""
+
+
+def test_zuk(cfg):
+    links = zuk.extract_links(ZUK_LIST, cfg)
+    assert set(links) == {"31234-198765", "31555-200001"}
+    l = zuk.parse_detail(ZUK_DETAIL, links["31234-198765"], "31234-198765", "itaim-bibi", cfg)
+    assert l.area == 152.3 and l.price == 1920000 and l.neighborhood == "Itaim Bibi"
+    assert "20/11/2026" in l.extra and cfg.matches(l)
+    casa = ZUK_DETAIL.replace("Apartamento", "Casa")
+    assert zuk.parse_detail(casa, "u", "1", "itaim-bibi", cfg) is None
+
+
+def test_full_cycle(tmp_path, monkeypatch, cfg):
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    a = Listing("zap", "1", "https://z/1", "venda", neighborhood="Itaim Bibi", area=120, price=3_000_000)
+    b = Listing("zap", "2", "https://z/2", "venda", neighborhood="Itaim Bibi", area=130, price=2_000_000)
+    batches = iter([{"zap": [a]}, {"zap": [a, b]}, {"zap": [Listing(**{**a.to_dict(), "price": 2_800_000}), b]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+
+    app.run()  # carga inicial: só aviso de ativação
+    assert len(sent) == 1 and "ativado" in sent[0][0]
+    app.run()  # b é novo
+    assert "novo" in sent[1][0] and "https://z/2" in sent[1][1][0][0]
+    app.run()  # a caiu de preço 6,7%
+    assert "baixaram" in sent[2][0]
+    assert "Itaim Bibi" in (tmp_path / "ANUNCIOS.md").read_text()
+    data = json.loads((tmp_path / "dados.json").read_text())
+    rows = {r["id"]: r for r in data["listings"]}
+    assert rows["1"]["initial"] and not rows["2"]["initial"]
+    assert [p for _, p in rows["1"]["hist"]] == [3_000_000, 2_800_000]
+    assert rows["1"]["active"] and rows["1"]["ppm2"] == round(2_800_000 / 120, 2)
+    assert data["history"][-1]["groups"]["venda|Itaim Bibi"]["n"] == 2
+
+
+def test_whatsapp_callmebot(monkeypatch):
+    from imoveis import notify
+    monkeypatch.setenv("CALLMEBOT_PHONE", "+5511999998888")
+    monkeypatch.setenv("CALLMEBOT_APIKEY", "123456")
+    for var in ("TELEGRAM_BOT_TOKEN", "NTFY_TOPIC", "SMTP_USER"):
+        monkeypatch.delenv(var, raising=False)
+    calls = []
+
+    class Resp:
+        status_code, text = 200, "Message queued."
+
+    monkeypatch.setattr(notify.Http, "get", lambda self, url, **kw: calls.append(kw["params"]) or Resp())
+    monkeypatch.setattr(notify.Http, "_wait", lambda self: None)
+    l = Listing("zap", "1", "https://z/1", "venda", neighborhood="Itaim Bibi", area=120, price=3_000_000)
+    n = notify.Notifier()
+    assert n.configured
+    n.send("🏠 1 anúncio novo", [notify.describe(l)])
+    assert len(calls) == 1
+    assert calls[0]["phone"] == "+5511999998888" and calls[0]["apikey"] == "123456"
+    assert "*🏠 1 anúncio novo*" in calls[0]["text"] and "https://z/1" in calls[0]["text"]
+    # muitos anúncios: mensagens curtas (o CallMeBot corta as longas), quebradas entre anúncios, no máximo 9
+    calls.clear()
+    item = notify.describe(l)
+    n.send("muitos", [item] * 200)
+    assert len(calls) == 9 and "mais" in calls[-1]["text"]
+    assert all(len(c["text"]) <= notify.Notifier.WA_MAX for c in calls)
+    assert all(c["text"].count("https://z/1") * len(item[0]) <= len(c["text"]) for c in calls)   # anúncios inteiros
+    assert not any(c["text"].startswith("\n") for c in calls)
+
+
+def test_plausibility(cfg):
+    typo = Listing("quintoandar", "1", "u", "venda", neighborhood="Itaim Bibi", area=3000, price=5_800_000)
+    assert not cfg.matches(typo)
+    cheap = Listing("quintoandar", "2", "u", "venda", neighborhood="Itaim Bibi", area=150, price=150_000)
+    assert not cfg.matches(cheap)
+    ok = Listing("quintoandar", "3", "u", "aluguel", neighborhood="Itaim Bibi", area=120, price=None, total_monthly=9959)
+    assert cfg.matches(ok)
+    from imoveis.notify import describe
+    text = describe(Listing("quintoandar", "4", "u", "aluguel", neighborhood="Itaim Bibi", area=108,
+                            total_monthly=13941, bedrooms=1, parking=1))[0]
+    assert "Aluguel ?" not in text and "1 quarto ·" in text and "1 vaga" in text
+
+
+def test_budget_alerts(tmp_path, monkeypatch):
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_sale=2_250_000, max_rent=10_000)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def L(id_, business, price=None, total=None):
+        return Listing("zap", id_, f"https://z/{id_}", business, neighborhood="Itaim Bibi", area=120,
+                       price=price, total_monthly=total)
+
+    base = [L("1", "venda", 2_000_000)]
+    batches = iter([
+        {"zap": base},
+        {"zap": base + [L("2", "venda", 3_000_000), L("3", "aluguel", 7_000, 9_500), L("4", "aluguel", 9_000, 12_000)]},
+        {"zap": base + [L("2", "venda", 2_200_000), L("3", "aluguel", 7_000, 9_500), L("4", "aluguel", 9_000, 12_000)]},
+    ])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear()
+    app.run()  # 2 (R$ 3 mi) e 4 (R$ 12 mil/mês) estão acima do orçamento: só 3 avisa
+    assert len(sent) == 1 and [t for t, _ in sent[0][1]][0].endswith("https://z/3")
+    sent.clear()
+    app.run()  # 2 baixou para R$ 2,2 mi e entrou no orçamento
+    assert len(sent) == 1 and "entrou no seu orçamento" in sent[0][1][0][0]
+    rows = {r["id"]: r for r in json.loads((tmp_path / "dados.json").read_text())["listings"]}
+    assert rows["2"]["in_budget"] and not rows["4"]["in_budget"]
+    assert "https://z/4" not in (tmp_path / "ANUNCIOS.md").read_text()
+
+
+def test_quintoandar_rent_from_total():
+    h = {"id": 1, "area": 120, "totalCost": 12500, "iptuPlusCondominium": 2500, "type": "Apartamento",
+         "neighbourhood": "Itaim Bibi"}
+    l = quintoandar.parse_house(h, "aluguel")
+    assert l.price == 10000 and l.total_monthly == 12500
+
+
+def test_grupozap_param_ladder(cfg, monkeypatch):
+    """Se a API recusar os parâmetros (400), recua para um conjunto mais simples e lembra dele."""
+    grupozap._working_rung.clear(); grupozap._page_size.clear(); grupozap._sort.clear()
+    calls = []
+
+    class R:
+        def __init__(self, code, body):
+            self.status_code, self._body = code, body
+            self.text = json.dumps(body)
+
+        def json(self):
+            return self._body
+
+    class FakeHttp:
+        def get(self, url, params=None, headers=None):
+            calls.append(params.copy())
+            if "addressZone" in params:
+                return R(400, {"err": "bad"})
+            return R(200, {"search": {"totalCount": 1, "result": {"listings": [ZAP_ITEM]}}})
+
+    items = grupozap._fetch_api(FakeHttp(), cfg, "zap", "venda", "Itaim Bibi")
+    # tenta as ordenações com todos os filtros, depois simplifica voltando à ordenação preferida
+    assert [("addressZone" in c, c.get("sort")) for c in calls] == [
+        (True, "createdAt DESC"), (True, "updatedAt DESC"), (True, None), (False, "createdAt DESC")]
+    assert len(items) == 1 and calls[3]["usableAreasMin"] == 100 and calls[3]["unitTypes"] == "APARTMENT"
+    calls.clear()
+    grupozap._fetch_api(FakeHttp(), cfg, "zap", "aluguel", "Itaim Bibi")
+    assert len(calls) == 1  # já começa pelo conjunto que funcionou
+
+
+def test_quintoandar_real_fields(cfg):
+    """Formato observado no site em 11/10/2026."""
+    h = {"id": "893060793", "rentPrice": 7500, "area": 168, "bedrooms": 3, "totalCost": 11414,
+         "forSale": True, "forRent": False, "salePrice": 3098560, "parkingSpots": 2, "condoIptu": 3624,
+         "address": {"address": "Rua Tapinas", "city": "São Paulo"}, "regionName": "Itaim Bibi",
+         "neighbourhood": "Itaim Bibi", "type": "Apartamento"}
+    sale = quintoandar.parse_house(h, "venda")
+    assert sale.price == 3098560 and sale.address == "Rua Tapinas" and sale.condo == 3624
+    assert quintoandar.parse_house(h, "aluguel") is None  # forRent False
+    rent = quintoandar.parse_house({**h, "forRent": True, "salePrice": 0}, "aluguel")
+    assert rent.price == 7500 and rent.total_monthly == 11414
+    assert quintoandar.parse_house({**h, "salePrice": 0}, "venda") is None
+
+
+def test_vivareal_dedup(monkeypatch, cfg):
+    a = Listing("zap", "1", "u", "venda", neighborhood="Itaim Bibi", area=120, price=2_000_000)
+    b = Listing("vivareal", "1", "u", "venda", neighborhood="Itaim Bibi", area=120, price=2_000_000)
+    c = Listing("vivareal", "2", "u", "venda", neighborhood="Itaim Bibi", area=130, price=2_100_000)
+    monkeypatch.setattr(grupozap, "fetch", lambda http, cfg, src: [a] if src == "zap" else [b, c])
+    monkeypatch.setattr(quintoandar, "fetch", lambda http, cfg: [])
+    monkeypatch.setattr(zuk, "fetch", lambda *a, **k: [])
+    results, errors = app.collect(cfg, {"seen": {}, "zuk_rejected": []})
+    assert [l.id for l in results["vivareal"]] == ["2"]
+
+
+def test_grupozap_page_size_fallback(cfg):
+    """Mensagem real da API: 'Size is above acceptable limit' → reduz a página, mantém os filtros."""
+    grupozap._working_rung.clear(); grupozap._page_size.clear(); grupozap._sort.clear()
+    sizes = []
+
+    class R:
+        def __init__(self, code, body):
+            self.status_code, self._body, self.text = code, body, json.dumps(body)
+
+        def json(self):
+            return self._body
+
+    class FakeHttp:
+        def get(self, url, params=None, headers=None):
+            sizes.append((params["size"], "addressZone" in params))
+            if params["size"] > 15:
+                return R(400, {"err": "{ details: { message: 'Size is above acceptable limit' } }"})
+            return R(200, {"search": {"totalCount": 1, "result": {"listings": [ZAP_ITEM]}}})
+
+    assert len(grupozap._fetch_api(FakeHttp(), cfg, "zap", "venda", "Itaim Bibi")) == 1
+    assert sizes == [(24, True), (15, True)]
+
+
+class _R:
+    def __init__(self, code, text):
+        self.status_code, self.text = code, text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def test_quintoandar_keeps_partial_on_pagination_limit(cfg):
+    """Mensagem real: 'Pagination exceeds the maximum limit' — mantém o que já veio."""
+    class FakeHttp:
+        def post(self, url, json=None, headers=None):
+            off = json["pagination"]["offset"]
+            if off >= 72:
+                return _R(400, '{"code":400,"message":"Validation failed: [searchCriteria.pagination: '
+                               'Pagination exceeds the maximum limit]"}')
+            hits = [{"_source": {"id": off + i, "area": 120}} for i in range(36)]
+            return _R(200, __import__("json").dumps({"hits": {"hits": hits, "total": {"value": 5000}}}))
+
+    houses = quintoandar._fetch_api(FakeHttp(), cfg, "venda")
+    assert len(houses) == 72 * len(cfg.neighborhoods)
+
+
+def test_zuk_discovers_page_param(cfg):
+    page1 = '<a href="/imovel/sp/sao-paulo/moema/rua-a-1/1-1">x</a>'
+    page2 = '<a href="/imovel/sp/sao-paulo/itaim-bibi/rua-b-2/2-2">y</a>'
+    detail = '<meta property="og:title" content="Apartamento 120 m²"><p>Área útil: 120 m²</p>'
+
+    class FakeHttp:
+        def get(self, url, **kw):
+            if "/imovel/" in url:
+                return _R(200, detail)
+            if "robots" in url or "sitemap" in url:
+                return _R(404, "")
+            if url.endswith("?pagina=2"):
+                return _R(200, page2)
+            if "?pagina=3" in url:
+                return _R(200, page2)  # nada novo: para
+            return _R(200, page1)      # base e parâmetros ignorados
+
+    found = zuk.fetch(FakeHttp(), cfg, set(), set())
+    assert [l.id for l in found] == ["2-2"] and found[0].neighborhood == "Itaim Bibi"
+
+
+def test_new_neighborhood_is_initial_load(tmp_path, monkeypatch):
+    """Bairro incluído depois: anúncios dele entram como carga inicial, sem aviso; os seguintes avisam."""
+    cfg = Config(neighborhoods=["Itaim Bibi", "Jardim Paulista"], min_area=100)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    (tmp_path / "state.json").write_text(json.dumps({"seen": {}, "initialized": ["zap"], "initialized_nbs": {"zap": ["itaim bibi"]}}))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def L(i, nb):
+        return Listing("zap", i, f"https://z/{i}", "venda", neighborhood=nb, area=120, price=2_000_000)
+
+    batches = iter([{"zap": [L("1", "Itaim Bibi"), L("2", "Jardim Paulista")]},
+                    {"zap": [L("1", "Itaim Bibi"), L("2", "Jardim Paulista"), L("3", "Jardim Paulista")]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run()
+    news = [t for subj, items in sent if "novo" in subj for t, _ in items]
+    assert news and all("https://z/2" not in t for t in news) and any("https://z/1" in t for t in news)
+    st = json.loads((tmp_path / "state.json").read_text())
+    assert st["seen"]["zap:venda:2"]["initial"] and "jardim paulista" in st["initialized_nbs"]["zap"]
+    sent.clear(); app.run()
+    news = [t for subj, items in sent if "novo" in subj for t, _ in items]
+    assert len(news) == 1 and "https://z/3" in news[0]
+
+
+def test_grupozap_zero_results_drops_zone(cfg):
+    """Zona/locationId fixos podem não bater com o bairro: 0 resultados -> tenta sem eles."""
+    grupozap._working_rung.clear(); grupozap._page_size.clear(); grupozap._sort.clear()
+    calls = []
+
+    class FakeHttp:
+        def get(self, url, params=None, headers=None):
+            calls.append("addressZone" in params)
+            body = {"search": {"totalCount": 0, "result": {"listings": []}}} if "addressZone" in params else \
+                   {"search": {"totalCount": 1, "result": {"listings": [ZAP_ITEM]}}}
+            return _R(200, json.dumps(body))
+
+    assert len(grupozap._fetch_api(FakeHttp(), cfg, "zap", "venda", "Jardim Paulista")) == 1
+    assert calls == [True, False]
+    calls.clear()
+    grupozap._fetch_api(FakeHttp(), cfg, "zap", "venda", "Itaim Bibi")
+    assert calls[0] is True   # memória é por bairro: outro bairro volta a tentar com zona
+
+
+def test_quintoandar_tiles_large_neighborhood():
+    """Jardim Paulista é dividido em faixas; cada uma é paginada; ids repetidos viram um anúncio só."""
+    cfg3 = Config(neighborhoods=["Jardim Paulista"], min_area=100)
+    seen_vps = []
+
+    class FakeHttp:
+        def post(self, url, json=None, headers=None):
+            vp = json["filters"]["location"]["viewport"]; seen_vps.append(vp["west"])
+            hits = [{"_source": {"id": 1, "area": 120, "salePrice": 2_000_000, "type": "Apartamento", "neighbourhood": "Jardim Paulista"}}]
+            return _R(200, __import__("json").dumps({"hits": {"hits": hits, "total": {"value": 1}}}))
+
+    houses = quintoandar._fetch_api(FakeHttp(), cfg3, "venda")
+    assert len(set(seen_vps)) == 3 and len(houses) == 3
+    assert len([l for l in quintoandar.fetch(FakeHttp(), cfg3) if l.business == "venda"]) == 1
+
+
+def test_focus_parse_latest_snapshot():
+    from imoveis import macro
+    rows = [
+        {"Indicador": "Selic", "Data": "2026-10-24", "DataReferencia": "2026", "Mediana": 15.0, "numeroRespondentes": 80},
+        {"Indicador": "Selic", "Data": "2026-10-31", "DataReferencia": "2026", "Mediana": 15.0, "numeroRespondentes": 90},
+        {"Indicador": "Selic", "Data": "2026-10-31", "DataReferencia": "2027", "Mediana": 12.25, "numeroRespondentes": 88},
+        {"Indicador": "Selic", "Data": "2026-10-31", "DataReferencia": "2028", "Mediana": 10.5, "numeroRespondentes": 70},
+    ]
+    out = macro.parse_focus(rows)
+    assert out["data"] == "2026-10-31" and out["anos"] == {2026: 15.0, 2027: 12.25, 2028: 10.5} and out["respondentes"] == 90
+
+
+def test_focus_update_keeps_previous_on_failure(tmp_path, monkeypatch):
+    from imoveis import macro
+    monkeypatch.setattr(macro, "MACRO", tmp_path / "macro.json")
+    (tmp_path / "macro.json").write_text(json.dumps({"atualizado": "2026-10-31T10:00:00+00:00", "selic": {"data": "2026-10-31", "anos": {"2026": 15.0}}}))
+
+    class Down:
+        def get(self, *a, **k):
+            return _R(503, "fora do ar")
+
+    out = macro.update(Down())
+    assert out["selic"]["anos"] == {"2026": 15.0} and out["erro"] and out["atualizado"] == "2026-10-31T10:00:00+00:00"
+
+
+def test_focus_url_uses_percent20():
+    from imoveis import macro
+    u = macro.odata_url({"$filter": "Indicador eq 'IGP-M' and baseCalculo eq 0", "$orderby": "Data desc"})
+    assert "+" not in u.split("?", 1)[1] and "Indicador%20eq%20'IGP-M'" in u and "Data%20desc" in u
+
+
+def test_dedupe_key():
+    from imoveis import dedupe
+    a = {"business": "venda", "neighborhood": "Itaim Bibi", "address": "Rua Joaquim Floriano, 100 - Itaim", "area": 120.4, "price": 2_000_000}
+    b = {**a, "address": "R. Joaquim Floriano", "area": 120.0}            # QuintoAndar: sem número
+    assert dedupe.key(a) == dedupe.key(b)
+    assert dedupe.key({**a, "price": 2_010_000}) != dedupe.key(a)
+    assert dedupe.key({**a, "address": ""}) is None
+    assert dedupe.key({**a, "business": "leilao"}) is None
+    r = {"business": "aluguel", "neighborhood": "Itaim Bibi", "address": "Rua A B", "area": 100, "price": 8000, "total_monthly": 10_000}
+    assert dedupe.key(r) == dedupe.key({**r, "price": None})              # aluguel compara pelo total
+
+
+def test_duplicates_grouped_and_not_alerted(tmp_path, monkeypatch):
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_sale=2_250_000, max_rent=13_000)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def L(src, id_, addr="Rua Tabapuã 500", price=2_000_000):
+        return Listing(src, id_, f"https://{src}/{id_}", "venda", neighborhood="Itaim Bibi", address=addr, area=130, price=price)
+
+    batches = iter([
+        {"zap": [L("zap", "1")], "quintoandar": [L("quintoandar", "9", "Rua Tabapuã", 1_500_000)]},
+        # republicação no ZAP + mesma unidade no QuintoAndar + um imóvel realmente novo
+        {"zap": [L("zap", "1"), L("zap", "2"), L("zap", "3", price=1_900_000)], "quintoandar": [L("quintoandar", "9", "Rua Tabapuã", 1_500_000), L("quintoandar", "8", "Rua Tabapuã")]},
+    ])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear()
+    app.run()
+    alerted = [t for subj, items in sent if "novo" in subj for t, _ in items]
+    assert len(alerted) == 1 and alerted[0].endswith("https://zap/3")
+    data = json.loads((tmp_path / "dados.json").read_text())
+    rows = {r["key"]: r for r in data["listings"]}
+    unit = rows["zap:venda:1"]
+    assert {c["url"] for c in unit["also"]} == {"https://zap/2", "https://quintoandar/8"}
+    assert unit["initial"] and "zap:venda:2" not in rows and len(rows) == 3
+    assert data["dedupe"] == {"grupos": 1, "copias": 2, "por_fonte": {"zap": 1, "quintoandar": 1}}
+
+
+def test_rent_ppm2_uses_total_and_history_is_rebased():
+    from imoveis import dashboard
+    assert dashboard.ppm2({"business": "aluguel", "price": 8000, "total_monthly": 10_000, "area": 100}) == 100
+    assert dashboard.ppm2({"business": "aluguel", "price": None, "total_monthly": 9000, "area": 100}) == 90
+    assert dashboard.ppm2({"business": "venda", "price": 2_000_000, "total_monthly": None, "area": 100}) == 20_000
+    catalog = {
+        "zap:aluguel:1": {"source": "zap", "business": "aluguel", "neighborhood": "Itaim Bibi", "area": 100, "price": 8000, "total_monthly": 10_000},
+        "quintoandar:aluguel:2": {"source": "quintoandar", "business": "aluguel", "neighborhood": "Itaim Bibi", "area": 100, "price": None, "total_monthly": 12_000},
+    }
+    state = {"seen": {
+        "zap:aluguel:1": {"first_seen": "2026-10-11T10:00:00+00:00", "last_seen": "2026-11-03T10:00:00+00:00",
+                          "hist": [["2026-10-11T10:00:00+00:00", 11_000], ["2026-10-20T10:00:00+00:00", 10_000]]},
+        "quintoandar:aluguel:2": {"first_seen": "2026-10-15T10:00:00+00:00", "last_seen": "2026-11-03T10:00:00+00:00",
+                                  "hist": [["2026-10-15T10:00:00+00:00", 12_000]]},
+    }}
+    hist = [{"date": d, "groups": {"aluguel|Itaim Bibi": {"n": 1, "ppm2": 80.0}, "venda|Itaim Bibi": {"n": 1, "ppm2": 20_000}}}
+            for d in ("2026-10-12", "2026-10-16", "2026-10-21")]
+    out = dashboard.rebase_rent_history(hist, catalog, state)
+    assert [h["groups"]["aluguel|Itaim Bibi"]["ppm2"] for h in out] == [110, 115, 110]   # preço vigente em cada dia
+    assert all(h["groups"]["venda|Itaim Bibi"]["ppm2"] == 20_000 and h["rent_basis"] == "total" for h in out)
+    out[0]["groups"]["aluguel|Itaim Bibi"]["ppm2"] = 1.0
+    assert dashboard.rebase_rent_history(out, catalog, state)[0]["groups"]["aluguel|Itaim Bibi"]["ppm2"] == 1.0  # só uma vez
+
+
+def test_removed_neighborhood_leaves_dashboard_and_state(tmp_path, monkeypatch):
+    """Bairro retirado do config: some do painel e do estado; se voltar, entra de novo como carga inicial."""
+    cfgs = {"v": Config(neighborhoods=["Itaim Bibi", "Jardim Paulista"], min_area=100)}
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfgs["v"]))
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": None)
+
+    def L(i, nb):
+        return Listing("zap", i, f"https://z/{i}", "venda", neighborhood=nb, area=120, price=2_000_000)
+
+    batches = iter([{"zap": [L("1", "Itaim Bibi"), L("2", "Jardim Paulista")]}, {"zap": [L("1", "Itaim Bibi")]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run()
+    cfgs["v"] = Config(neighborhoods=["Itaim Bibi"], min_area=100)
+    app.run()
+    rows = json.loads((tmp_path / "dados.json").read_text())["listings"]
+    st = json.loads((tmp_path / "state.json").read_text())
+    assert [r["id"] for r in rows] == ["1"]
+    assert "zap:venda:2" not in st["seen"] and st["initialized_nbs"]["zap"] == ["itaim bibi"]
+    assert "zap:venda:2" not in json.loads((tmp_path / "catalogo.json").read_text())
+
+
+def test_bargain_alerts_below_median(tmp_path, monkeypatch):
+    """Novo anúncio ≥ 20% abaixo da mediana (bairro + faixa) vira aviso próprio; queda que cruza o limite também."""
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_sale=3_000_000, max_rent=20_000, bargain_pct=20, bargain_min_n=5)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def V(i, price, area=120, nb="Itaim Bibi"):
+        return Listing("zap", str(i), f"https://z/{i}", "venda", neighborhood=nb, address=f"Rua {i} 1", area=area, price=price)
+
+    def A(i, total, area=120):
+        return Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood="Itaim Bibi", address=f"Rua a{i} 1", area=area, price=total * .8, total_monthly=total)
+
+    base = [V(i, 2_400_000 + i * 10_000) for i in range(10)] + [A(i, 12_000 + i * 100) for i in range(10)]   # ~R$ 20 mil/m²; ~R$ 100/m²·mês
+    batches = iter([
+        {"zap": base},
+        {"zap": base + [V(100, 1_700_000), V(101, 2_300_000), A(100, 8_500), V(102, 2_200_000)]},          # −29% e −4%; aluguel −29%
+        {"zap": base + [V(100, 1_700_000), V(101, 2_300_000), A(100, 8_500), V(102, 1_800_000)]},          # 102 baixou e cruzou o limite
+    ])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear()
+    app.run()
+    subj = [s for s, _ in sent]
+    bargain = next(items for s, items in sent if s.startswith("💎"))
+    texts = [t for t, _ in bargain]
+    assert len(texts) == 2 and any("https://z/100" in t for t in texts) and any("https://z/a100" in t for t in texts)
+    assert all("vs. mediana (Itaim Bibi, 100–150 m² no seu orçamento)" in t for t in texts)
+    import re as _re
+    assert all(int(_re.match(r"−(\d+)%", t).group(1)) >= 20 for t in texts)   # ex.: "−31% vs. mediana …"
+    novos = [t for s, items in sent if "novo" in s for t, _ in items]
+    assert any("https://z/101" in t for t in novos) and not any("https://z/100\n" in t + "\n" for t in novos)  # não repete
+    sent.clear()
+    app.run()
+    bargain = [items for s, items in sent if s.startswith("💎")]
+    assert len(bargain) == 1 and "https://z/102" in bargain[0][0][0] and "baixou de R$ 2.200.000 para R$ 1.800.000" in bargain[0][0][0]
+    assert not any("https://z/102" in t for s, items in sent if s.startswith("📉") for t, _ in items)
+
+
+def test_bargain_market_falls_back_to_neighborhood():
+    from imoveis import bargain
+    rows = [{"business": "venda", "neighborhood": "Itaim Bibi", "area": 120, "price": 2_400_000} for _ in range(20)]
+    m = bargain.Market(rows, min_n=15)
+    g = m.gap({"business": "venda", "neighborhood": "Itaim Bibi", "area": 400, "price": 4_000_000})   # faixa 300+ vazia → bairro
+    assert g.scope == "Itaim Bibi" and round(g.pct, 2) == -0.5
+    assert m.gap({"business": "leilao", "neighborhood": "Itaim Bibi", "area": 120, "price": 1}) is None
+    assert m.gap({"business": "venda", "neighborhood": "Moema", "area": 120, "price": 1_000_000}) is None
+
+
+def test_rent_immediate_purchase_daily_digest(tmp_path, monkeypatch):
+    """Aluguel ≥ 120 m² avisa na hora; compra vai para o resumo diário (a partir das 23h de Brasília)."""
+    from datetime import datetime
+    cfg = Config(neighborhoods=["Itaim Bibi", "Vila Nova Conceição"], min_area=100, max_sale=3_000_000, max_rent=20_000,
+                 bargain_pct=25, bargain_min_n=5, alert_min_area=120, immediate=("aluguel",), digest=("venda", "leilao"),
+                 digest_hour=23, dashboard_url="https://x/painel/")
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+    clock = {"t": datetime(2026, 11, 7, 15, 17, tzinfo=app.SP)}
+    monkeypatch.setattr(app, "now_sp", lambda: clock["t"])
+    monkeypatch.setattr(app, "now", lambda: clock["t"].astimezone(__import__("datetime").timezone.utc).isoformat(timespec="seconds"))
+
+    def V(i, price, area=130, nb="Itaim Bibi"):
+        return Listing("zap", str(i), f"https://z/{i}", "venda", neighborhood=nb, address=f"Rua {i} 1", area=area, price=price)
+
+    def A(i, total, area=130):
+        return Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood="Itaim Bibi", address=f"Rua a{i} 1", area=area, price=total * .8, total_monthly=total)
+
+    base = [V(i, 2_400_000 + i * 10_000) for i in range(10)] + [A(i, 12_000 + i * 100) for i in range(10)] + [V(50, 2_700_000, nb="Vila Nova Conceição")]
+    batches = iter([
+        {"zap": base},
+        {"zap": base + [A(100, 12_550), A(101, 11_000, area=110), V(200, 2_500_000), V(201, 1_600_000, nb="Itaim Bibi"),
+                        V(202, 2_450_000, nb="Vila Nova Conceição"), V(203, 1_000_000, area=110)]},
+        {"zap": base + [A(100, 12_550), A(101, 11_000, area=110), V(200, 2_500_000), V(201, 1_600_000),
+                        V(202, 2_450_000, nb="Vila Nova Conceição"), V(203, 1_000_000, area=110)]},
+        {"zap": base},
+    ])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear()
+    app.run()                                                     # 15h: só o aluguel ≥ 120 m² avisa
+    urls = [t for _, items in sent for t, _ in items]
+    assert any("https://z/a100" in t for t in urls) and not any("https://z/a101" in t for t in urls)
+    assert not any("https://z/20" in t for t in urls)              # compra não avisa na hora
+    st = json.loads((tmp_path / "state.json").read_text())
+    day = list(st["digest"])[0]
+    assert {x["key"] for x in st["digest"][day]} == {"zap:venda:200", "zap:venda:201", "zap:venda:202"}   # 203 tem 110 m²
+    sent.clear(); clock["t"] = datetime(2026, 11, 7, 23, 17, tzinfo=app.SP)
+    app.run()                                                     # 23h: resumo do dia
+    dig = [(s, items) for s, items in sent if s.startswith("🏢")]
+    assert len(dig) == 1 and dig[0][0] == "🏢 Compra — resumo de 07/11"
+    text = "\n".join(t for t, _ in dig[0][1])
+    assert "3 anúncios novos de compra (120 m² ou mais, até R$ 3.000.000): Itaim Bibi 2 · Vila Nova Conceição 1" in text
+    assert "Possíveis oportunidades" in text and "https://z/201" in text and "Painel: https://x/painel/#anuncios" in text
+    assert "digest" not in json.loads((tmp_path / "state.json").read_text()) or not json.loads((tmp_path / "state.json").read_text())["digest"]
+    sent.clear(); clock["t"] = datetime(2026, 11, 8, 23, 17, tzinfo=app.SP)
+    app.run()                                                     # dia sem novidade: mensagem curta
+    dig = [items for s, items in sent if s.startswith("🏢")]
+    assert len(dig) == 1 and dig[0][0][0].startswith("0 anúncios novos de compra")
+
+
+def test_missed_digest_goes_out_next_run():
+    from datetime import datetime
+    cfg = Config(neighborhoods=["Itaim Bibi"], digest=("venda",), digest_hour=23, alert_min_area=120, bargain_pct=25)
+    state = {"digest": {"2026-11-07": [{"kind": "novo", "key": "k", "business": "venda", "nb": "Itaim Bibi", "area": 130, "price": 2e6,
+                                         "old": None, "url": "u", "addr": "R", "bedrooms": 3, "source": "zap", "pct": -0.1, "scope": "s", "median": 1}]}}
+    out = []
+    class N:
+        def send(self, s, items, footer=""): out.append(s)
+    assert app.send_digests(state, cfg, N(), datetime(2026, 11, 8, 1, 47, tzinfo=app.SP)) == ["2026-11-07"]
+    assert out == ["🏢 Compra — resumo de 07/11"] and state["digest"] == {} and state["digest_last"] == "2026-11-07"
+    assert app.send_digests(state, cfg, N(), datetime(2026, 11, 8, 15, 0, tzinfo=app.SP)) == []      # antes das 23h, nada
+
+
+def test_alert_min_bedrooms(tmp_path, monkeypatch):
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_rent=20_000, alert_min_area=120, alert_min_bedrooms=3, immediate=("aluguel",))
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def A(i, q):
+        return Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood="Itaim Bibi", address=f"Rua {chr(65 + i)} 1",
+                       area=150, price=10_000 + i, total_monthly=12_000 + i, bedrooms=q)
+    batches = iter([{"zap": [A(0, 3)]}, {"zap": [A(0, 3), A(1, 2), A(2, 3), A(3, None)]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear(); app.run()
+    urls = " ".join(t for _, items in sent for t, _ in items)
+    assert "https://z/a2" in urls and "https://z/a3" in urls and "https://z/a1" not in urls
+
+
+def test_highlights_floor_and_description():
+    from imoveis import details
+    L = lambda **k: Listing("zap", "1", "https://z/1", "aluguel", neighborhood="Itaim Bibi", area=150, **k)
+    assert details.highlights(L(floor=14), None) == ["andar alto (14º)"]
+    assert details.highlights(L(floor=3), "Lindo apartamento em andar alto com vista definitiva para o parque") == ["andar alto", "vista livre"]
+    assert details.highlights(L(), "Sem prédios na frente, sol da manhã") == ["vista livre"]
+    assert details.highlights(L(), "Apartamento térreo, vista para o jardim interno") == []
+    html = '<script>{"description":"Apartamentos para alugar em Vila Nova Conceição. Entre em contato!","x":{"description":"Andar alto, vista livre, 3 suítes, reformado, 2 vagas e depósito."}}</script>'
+    assert details.descriptions(html)[0].startswith("Apartamentos") or "Andar alto" in " ".join(details.descriptions(html))
+
+
+def test_immediate_alert_star(tmp_path, monkeypatch):
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_rent=20_000, alert_min_area=120, immediate=("aluguel",), highlight=True)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard, details
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    monkeypatch.setattr(details, "fetch_description", lambda http, l: "Andar alto e vista livre" if l.id == "a2" else "Reformado")
+    monkeypatch.setattr(app.Http, "__init__", lambda self, *a, **k: None)
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def A(i):
+        return Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood="Itaim Bibi", address=f"Rua {chr(65 + i)} 1",
+                       area=150, price=10_000 + i, total_monthly=12_000 + i, bedrooms=3)
+    batches = iter([{"zap": [A(0)]}, {"zap": [A(0), A(1), A(2)]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear(); app.run()
+    subj, items = next((s, i) for s, i in sent if s.startswith("🏠"))
+    assert "⭐ 1 com destaque" in subj and items[0][0].startswith("⭐ Andar alto · vista livre") and "https://z/a2" in items[0][0]
+
+
+def test_geo_inside_and_coordinates_parsed():
+    from imoveis import geo
+    from imoveis.sources import grupozap, quintoandar
+    sq = [[0, 0], [0, 10], [10, 10], [10, 0]]
+    assert geo.inside(5, 5, sq) and not geo.inside(11, 5, sq) and not geo.inside(5, -1, sq)
+    notch = [[0, 0], [0, 10], [10, 10], [10, 6], [4, 5], [10, 4], [10, 0]]   # "U" com entalhe no meio
+    assert geo.inside(9, 2, notch) and not geo.inside(9, 5, notch) and geo.inside(2, 5, notch)
+    item = {"listing": {"id": "1", "unitTypes": ["APARTMENT"], "usableAreas": [150], "bedrooms": [3],
+                        "pricingInfos": [{"businessType": "RENTAL", "price": "10000", "rentalInfo": {"monthlyRentalTotalPrice": "12000"}}],
+                        "address": {"neighborhood": "Itaim Bibi", "street": "Rua Joaquim Floriano", "streetNumber": "960",
+                                    "point": {"lat": -23.585669, "lon": -46.679271, "source": "GOOGLE", "aproximated": False}}}}
+    l = grupozap.parse_listing(item, "zap", "aluguel")
+    assert (l.lat, l.lon, l.geo_approx) == (-23.585669, -46.679271, False)
+    item["listing"]["address"]["point"] = {"approximateLat": -23.584, "approximateLon": -46.685}
+    l = grupozap.parse_listing(item, "zap", "aluguel")
+    assert (l.lat, l.lon, l.geo_approx) == (-23.584, -46.685, True)
+    h = {"id": 9, "area": 150, "type": "Apartamento", "forRent": True, "rentPrice": 10000, "totalCost": 12000,
+         "neighbourhood": "Itaim Bibi", "address": "Rua Itacema", "location": {"lat": -23.579689, "lon": -46.6745796}}
+    l = quintoandar.parse_house(h, "aluguel")
+    assert (l.lat, l.lon) == (-23.579689, -46.6745796)
+
+
+def test_area_filter_on_alerts(tmp_path, monkeypatch):
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_rent=20_000, alert_min_area=120, immediate=("aluguel",),
+                 area_polygon=[[-23.58, -46.69], [-23.58, -46.67], [-23.60, -46.67], [-23.60, -46.69]])
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def A(i, lat, lon):
+        return Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood="Itaim Bibi", address=f"Rua {chr(65 + i)} 1",
+                       area=150, price=10_000 + i, total_monthly=12_000 + i, bedrooms=3, lat=lat, lon=lon)
+    batches = iter([{"zap": [A(0, -23.59, -46.68)]},
+                    {"zap": [A(0, -23.59, -46.68), A(1, -23.59, -46.68), A(2, -23.57, -46.68), A(3, None, None)]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear(); app.run()
+    urls = " ".join(t for _, items in sent for t, _ in items)
+    assert "https://z/a1" in urls and "https://z/a3" in urls and "https://z/a2" not in urls
+
+
+def test_digest_window_after_send_hour_goes_to_next_day(tmp_path, monkeypatch):
+    from datetime import datetime
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_sale=3_000_000, alert_min_area=120, immediate=("aluguel",),
+                 digest=("venda",), digest_hour=20)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+    clock = {"t": datetime(2026, 11, 7, 19, 17, tzinfo=app.SP)}
+    monkeypatch.setattr(app, "now_sp", lambda: clock["t"])
+    monkeypatch.setattr(app, "now", lambda: clock["t"].astimezone(__import__("datetime").timezone.utc).isoformat(timespec="seconds"))
+    V = lambda i: Listing("zap", str(i), f"https://z/{i}", "venda", neighborhood="Itaim Bibi", address=f"Rua {chr(65 + i)} 1", area=130, price=2_000_000 + i, bedrooms=3)
+    batches = iter([{"zap": [V(0)]}, {"zap": [V(0), V(1)]}, {"zap": [V(0), V(1), V(2)]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear()
+    clock["t"] = datetime(2026, 11, 7, 20, 17, tzinfo=app.SP); app.run()     # V1 aparece às 20h17 e o resumo sai
+    dig = [items for s, items in sent if s.startswith("🏢")]
+    assert len(dig) == 1 and dig[0][0][0].startswith("0 anúncios")          # V1 já é do resumo de amanhã
+    st = json.loads((tmp_path / "state.json").read_text())
+    assert list(st["digest"]) == ["2026-11-08"] and st["digest"]["2026-11-08"][0]["key"] == "zap:venda:1"
+    sent.clear(); clock["t"] = datetime(2026, 11, 7, 22, 17, tzinfo=app.SP); app.run()
+    assert not [s for s, _ in sent if s.startswith("🏢")]                   # nada de segunda mensagem no mesmo dia
+
+
+def test_area_accepts_other_labels_inside_polygon():
+    from imoveis.sources import quintoandar
+    poly = [[-23.58, -46.69], [-23.58, -46.67], [-23.60, -46.67], [-23.60, -46.69]]
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, area_polygon=poly, area_extra_neighborhoods=["Jardim Europa", "Itaim Bibi"])
+    L = lambda nb, lat, lon: Listing("quintoandar", "1", "u", "aluguel", neighborhood=nb, area=150, price=10_000, total_monthly=12_000, lat=lat, lon=lon)
+    assert cfg.matches(L("Jardim Paulista", -23.59, -46.68))        # rótulo diferente, mas dentro da área
+    assert not cfg.matches(L("Jardim Paulista", -23.57, -46.68))    # fora da área e fora dos bairros
+    assert cfg.matches(L("Itaim Bibi", -23.57, -46.68))             # bairro monitorado vale para o painel mesmo fora
+    assert cfg.query_neighborhoods == ["Itaim Bibi", "Jardim Europa"]
+    tiles = quintoandar.area_tiles(poly)
+    assert len(tiles) == 4 and min(t["south"] for t in tiles) == -23.60 and max(t["east"] for t in tiles) == -46.67
+
+
+def test_dashboard_includes_other_labels_inside_area(tmp_path, monkeypatch):
+    """Tudo dentro do polígono vai para o painel (grupo "Outros na área", com o rótulo do site), fica no estado
+    entre coletas e não volta a avisar como novo."""
+    poly = [[-23.58, -46.69], [-23.58, -46.67], [-23.60, -46.67], [-23.60, -46.69]]
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_rent=20_000, immediate=("aluguel",), area_polygon=poly)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def A(i, nb, lat, lon):
+        return Listing("quintoandar", f"a{i}", f"https://q/a{i}", "aluguel", neighborhood=nb, address=f"Rua {chr(65 + i)} 1",
+                       area=150, price=10_000 + i, total_monthly=12_000 + i, bedrooms=3, lat=lat, lon=lon)
+    base = [A(0, "Itaim Bibi", -23.59, -46.68), A(2, "Jardim Europa", -23.595, -46.685)]   # 1ª coleta = carga inicial do rótulo
+    batches = iter([{"quintoandar": base}, {"quintoandar": base + [A(1, "Jardim Europa", -23.59, -46.68)]},
+                    {"quintoandar": base + [A(1, "Jardim Europa", -23.59, -46.68)]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run(); sent.clear(); app.run()
+    assert "https://q/a1" in " ".join(t for _, items in sent for t, _ in items)
+    sent.clear(); app.run()
+    assert not sent                                                       # 3ª coleta: nada de novo
+    data = json.loads((tmp_path / "dados.json").read_text())
+    other = [r for r in data["listings"] if r["id"] == "a1"]
+    assert other and other[0]["neighborhood"] == dashboard.OTHER_NB and other[0]["neighborhood_label"] == "Jardim Europa"
+    assert data["criteria"]["neighborhoods"] == ["Itaim Bibi", dashboard.OTHER_NB]
+    assert "quintoandar:aluguel:a1" in json.loads((tmp_path / "state.json").read_text())["seen"]
+
+
+def test_price_drop_alert_10pct_cumulative(tmp_path, monkeypatch):
+    """Queda ≥ 10% avisa (mesmos critérios dos novos); degraus somam; depois do aviso, recomeça do preço avisado."""
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_rent=20_000, alert_min_area=120, alert_min_bedrooms=3,
+                 immediate=("aluguel",), price_drop_pct=10)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, items)))
+
+    def A(i, total, area=150):
+        return Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood="Itaim Bibi", address=f"Rua {chr(65 + i)} 1",
+                       area=area, price=total - 2_000, total_monthly=total, bedrooms=3)
+    steps = [(15_000, 15_000), (14_000, 12_000), (13_400, 12_000), (13_300, 12_000)]   # (a0, a1 com 100 m²)
+    batches = iter([{"zap": [A(0, p0), A(1, p1, area=100)]} for p0, p1 in steps])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    clock = iter(f"2026-11-0{d}T12:00:00+00:00" for d in range(1, 9))
+    monkeypatch.setattr(app, "now", lambda: next(clock))
+    drops = []
+    for _ in steps:
+        sent.clear(); app.run()
+        drops.append([t for s, items in sent if s.startswith("📉") for t, _ in items])
+    assert drops[1] == []                                   # −6,7%: ainda não
+    assert len(drops[2]) == 1 and "https://z/a0" in drops[2][0]   # −10,7% acumulado desde R$ 15.000
+    assert drops[3] == []                                   # −0,7% depois do aviso: não repete
+    assert not any("https://z/a1" in t for d in drops for t in d)   # 100 m²: fora dos critérios de aviso
+
+
+def test_air_conditioning_highlight():
+    from imoveis import details
+    L = Listing("zap", "1", "u", "aluguel", neighborhood="Itaim Bibi", area=150)
+    cases = {
+        "Apartamento com ar-condicionado em todas as suítes": "ar-condicionado",
+        "Ar condicionado central (VRF) e vista livre": "ar-condicionado",
+        "Living climatizado": "ar-condicionado",
+        "Infraestrutura para ar condicionado nos dormitórios": "infra para ar-condicionado",
+        "Preparado para ar-condicionado split": "infra para ar-condicionado",
+        "infra para ar condicionado. Suítes com ar-condicionado split": "ar-condicionado",
+        "Não possui ar condicionado": None,
+        "Sem ar condicionado": None,
+        "Sala ampla e varanda": None,
+    }
+    for text, want in cases.items():
+        assert details.air_conditioning(text) == want, text
+    assert details.highlights(L, "Ar condicionado central (VRF) e vista livre") == ["vista livre"]   # AR não é destaque de aviso
+
+
+def test_amenities_air_conditioning_and_view():
+    from imoveis import details
+    from imoveis.sources import grupozap, quintoandar
+    item = {"listing": {"id": "9", "unitTypes": ["APARTMENT"], "usableAreas": [150], "amenities": ["ELEVATOR", "AIR_CONDITIONING"],
+                        "pricingInfos": [{"businessType": "RENTAL", "price": "10000", "monthlyCondoFee": "2000"}],
+                        "address": {"neighborhood": "Itaim Bibi", "street": "Rua A", "streetNumber": "1"}}}
+    z = grupozap.parse_listing(item, "zap", "aluguel")
+    assert z.air_conditioning is True and z.free_view is None
+    item["listing"]["amenities"] = ["ELEVATOR"]
+    assert grupozap.parse_listing(item, "zap", "aluguel").air_conditioning is None
+    q = quintoandar.parse_house({"id": 5, "area": 150, "type": "Apartamento", "rentPrice": 10000, "totalCost": 12000, "forRent": True,
+                                 "neighbourhood": "Itaim Bibi", "amenities": ["AR_CONDICIONADO", "VISTA_LIVRE", "BOX"]}, "aluguel")
+    assert q.air_conditioning is True and q.free_view is True
+    assert details.highlights(q, None) == ["vista livre"]
+    assert details.highlights(q, "Vista livre e ar condicionado") == ["vista livre"]   # sem repetir
+
+
+def test_new_label_initial_load_is_silent(tmp_path, monkeypatch):
+    """Rótulo de bairro novo (fonte já ativa) entra como carga inicial sem mensagem de 'ativado'."""
+    poly = [[-23.58, -46.69], [-23.58, -46.67], [-23.60, -46.67], [-23.60, -46.69]]
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_rent=20_000, immediate=("aluguel",), area_polygon=poly)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append(subj))
+    A = lambda i, nb: Listing("zap", f"a{i}", f"https://z/a{i}", "aluguel", neighborhood=nb, address=f"Rua {chr(65 + i)} 1",
+                              area=150, price=10_000, total_monthly=12_000 + i, bedrooms=3, lat=-23.59, lon=-46.68)
+    batches = iter([{"zap": [A(0, "Itaim Bibi")]}, {"zap": [A(0, "Itaim Bibi"), A(1, "Vila Olímpia")]}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run()
+    assert any("ativado" in s for s in sent)          # 1ª coleta do site: avisa
+    sent.clear(); app.run()
+    assert not sent                                   # rótulo novo: carga inicial calada
+
+
+def test_purchase_alerts_only_with_highlight(tmp_path, monkeypatch):
+    """12/11: compra no resumo diário; novo só com andar alto, vista livre ou perto de parque; queda ≥ 10% sempre;
+    aluguel não avisa; abaixo da mediana não avisa."""
+    from datetime import datetime
+    from imoveis import geo
+    monkeypatch.setattr(geo, "_PARKS", {"Parque Teste": [[-23.580, -46.680], [-23.580, -46.670], [-23.585, -46.670], [-23.585, -46.680]]})
+    cfg = Config(neighborhoods=["Itaim Bibi"], min_area=100, max_sale=3_000_000, max_rent=20_000, alert_min_area=120,
+                 alert_min_bedrooms=3, immediate=(), digest=("venda",), digest_hour=19, new_require_highlight=True,
+                 park_max_m=500, price_drop_pct=10, bargain_pct=25, bargain_alert=False, bargain_min_n=1)
+    monkeypatch.setattr(app, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(app, "CURRENT", tmp_path / "anuncios.json")
+    monkeypatch.setattr(app, "REPORT", tmp_path / "ANUNCIOS.md")
+    from imoveis import dashboard
+    monkeypatch.setattr(dashboard, "CATALOG", tmp_path / "catalogo.json")
+    monkeypatch.setattr(dashboard, "HISTORY", tmp_path / "historico.json")
+    monkeypatch.setattr(dashboard, "OUTPUT", tmp_path / "dados.json")
+    monkeypatch.setattr(app.Config, "load", classmethod(lambda c: cfg))
+    sent = []
+    monkeypatch.setattr(app.Notifier, "send", lambda self, subj, items, footer="": sent.append((subj, [t for t, _ in items])))
+    clock = {"t": datetime(2026, 11, 12, 9, 17, tzinfo=app.SP)}
+    monkeypatch.setattr(app, "now_sp", lambda: clock["t"])
+    monkeypatch.setattr(app, "now", lambda: clock["t"].astimezone(__import__("datetime").timezone.utc).isoformat(timespec="seconds"))
+
+    def V(i, price=2_000_000, **kw):
+        return Listing("zap", f"v{i}", f"https://z/v{i}", "venda", neighborhood="Itaim Bibi", address=f"Rua {chr(65 + i)} 1",
+                       area=150, price=price, bedrooms=3, **kw)
+    far = dict(lat=-23.600, lon=-46.700)
+    base = [V(0, **far), V(1, **far)]
+    rent = Listing("zap", "a1", "https://z/a1", "aluguel", neighborhood="Itaim Bibi", address="Rua Z 1", area=150,
+                   price=8_000, total_monthly=10_000, bedrooms=3, floor=15)
+    later = [V(0, **far), V(1, price=1_700_000, **far),              # v1: −15%
+             V(2, floor=14, **far),                                   # andar alto
+             V(3, lat=-23.587, lon=-46.675),                          # ~220 m do parque
+             V(4, **far),                                             # sem destaque
+             V(5, price=900_000, **far),                              # muito abaixo da mediana, sem destaque
+             rent]
+    batches = iter([{"zap": base}, {"zap": later}, {"zap": later}])
+    monkeypatch.setattr(app, "collect", lambda c, s: (next(batches), {}))
+    app.run()
+    clock["t"] = datetime(2026, 11, 12, 15, 17, tzinfo=app.SP); sent.clear(); app.run()
+    assert not sent                                                                     # nada imediato
+    clock["t"] = datetime(2026, 11, 12, 19, 17, tzinfo=app.SP); app.run()
+    assert [s for s, _ in sent] == ["🏢 Compra — resumo de 12/11"]                    # nada imediato, nada de aluguel
+    text = "\n\n".join(sent[0][1])
+    assert "https://z/v2" in text and "Andar alto (14º)" in text
+    assert "https://z/v3" in text and "⭐ Perto do Parque Teste (200 m)" in text
+    assert "https://z/v1" in text and "baixou de R$ 2.000.000 (−15%)" in text
+    assert "https://z/v4" not in text and "https://z/v5" not in text and "https://z/a1" not in text
+    assert "4 anúncios novos de compra" in text and "Com destaque (andar alto, vista livre, parque, piscina ou churrasqueira do apto): 2." in text
+    assert "💎" not in text
+
+
+def test_real_parks_contours():
+    from imoveis import geo
+    geo._PARKS = None
+    assert set(geo.parks()) == {"Parque Ibirapuera", "Parque do Povo"}
+    assert geo.nearest_park(-23.5874, -46.6576, 500) == ("Parque Ibirapuera", 0.0)       # dentro do parque
+    name, d = geo.nearest_park(-23.5910, -46.6680, 500)                                    # Av. República do Líbano
+    assert name == "Parque Ibirapuera" and 300 < d < 420
+    assert geo.nearest_park(-23.5990, -46.6760, 500) is None                               # longe dos dois
+
+
+def test_leisure_highlights():
+    """15/11: piscina privativa e churrasqueira do apartamento são destaque; as do prédio só acompanham."""
+    from imoveis import details
+    from imoveis.sources import grupozap, quintoandar
+    L = Listing("zap", "1", "u", "venda", neighborhood="Itaim Bibi", area=150)
+    assert details.highlights(L, "Condomínio com piscina aquecida e churrasqueira") == []
+    assert details.extras(L, "Condomínio com piscina aquecida e churrasqueira") == ["piscina no prédio", "churrasqueira no prédio"]
+    assert details.highlights(L, "Varanda gourmet com churrasqueira. Piscina privativa no terraço") == \
+        ["piscina privativa", "churrasqueira na varanda"]
+    assert details.highlights(L, "Não possui piscina privativa") == [] and details.extras(L, "Sem piscina") == []
+    # ZAP: POOL/BARBECUE_GRILL = prédio; BARBECUE_BALCONY = varanda
+    assert grupozap._leisure({"POOL", "BARBECUE_GRILL"}) == {"pool": "predio", "bbq": "predio"}
+    assert grupozap._leisure({"HEATED_POOL", "BARBECUE_BALCONY", "BARBECUE_GRILL"}) == {"pool": "predio", "bbq": "apto"}
+    # QuintoAndar: amenities = unidade, installations = condomínio
+    assert quintoandar._leisure({"PISCINA_PRIVATIVA"}, {"PISCINA", "CHURRASQUEIRA"}) == {"pool": "apto", "bbq": "predio"}
+    q = quintoandar.parse_house({"id": 7, "area": 150, "type": "Apartamento", "salePrice": 2_000_000, "forSale": True,
+                                 "neighbourhood": "Itaim Bibi", "amenities": ["CHURRASQUEIRA"], "installations": ["PISCINA"]}, "venda")
+    assert (q.pool, q.bbq) == ("predio", "apto")
+    assert details.highlights(q, None) == ["churrasqueira na varanda"] and details.extras(q, None) == ["piscina no prédio"]
