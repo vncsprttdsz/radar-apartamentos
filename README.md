@@ -11,6 +11,9 @@ um painel publicado pelo GitHub Pages. Roda de graça no GitHub Actions; não pr
   duplicados agrupados, transações reais registradas no ITBI da Prefeitura e um simulador comprar × alugar com
   financiamento, FGTS e projeções do Boletim Focus.
 
+**Começando agora?** Siga o [PRIMEIROS-PASSOS.md](PRIMEIROS-PASSOS.md): ele tem o roteiro e as instruções para
+colar no Claude Code, que configura tudo para os seus bairros e preferências.
+
 Para ver o painel com dados fictícios antes de instalar: abra `docs/index.html?dados=demo.json` num servidor
 local (`cd docs && python -m http.server`).
 
