@@ -3,7 +3,10 @@
 Monitor de anúncios de apartamentos (compra, aluguel e leilão) em bairros de São Paulo, com avisos no WhatsApp e
 um painel publicado pelo GitHub Pages. Roda de graça no GitHub Actions; não precisa de servidor.
 
-- **Fontes:** ZAP Imóveis, Viva Real e QuintoAndar (venda e aluguel) e Portal Zuk (leilões).
+- **Fontes:** ZAP Imóveis, Viva Real e QuintoAndar (venda e aluguel); Portal Zuk, Mega Leilões e a lista oficial da
+  Caixa (leilões e imóveis retomados). Cada lote de leilão vem com lances e datas do 1º/2º leilão, custo total
+  estimado (comissão, ITBI, registro), comparação com os anúncios do bairro e com as vendas do prédio no ITBI, e o
+  aviso de ocupado/desocupado — critérios próprios na seção `leiloes` do `config.yaml`.
 - **Avisos:** anúncio novo dentro dos seus critérios, queda de preço, imóvel bem abaixo da mediana do bairro e
   fonte com erro. Aluguel pode avisar a cada coleta; compra num resumo diário. Destaques ⭐: andar alto, vista
   livre, perto de parque, piscina privativa e churrasqueira do apartamento.
