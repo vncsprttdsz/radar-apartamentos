@@ -128,5 +128,31 @@
     "price": 3100000
    }
   }
+ },
+ {
+  "date": "2026-11-21",
+  "rent_basis": "total",
+  "groups": {
+   "aluguel|Itaim Bibi": {
+    "n": 476,
+    "ppm2": 121.62,
+    "price": 15900
+   },
+   "aluguel|Vila Nova Conceição": {
+    "n": 501,
+    "ppm2": 164.5,
+    "price": 23000
+   },
+   "venda|Vila Nova Conceição": {
+    "n": 1201,
+    "ppm2": 30434.78,
+    "price": 5441200
+   },
+   "venda|Itaim Bibi": {
+    "n": 1368,
+    "ppm2": 19629.03,
+    "price": 3100000
+   }
+  }
  }
 ]
